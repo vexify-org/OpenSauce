@@ -1,0 +1,55 @@
+[package]
+name = "opensauce"
+version = "0.1.0"
+edition = "2021"
+description = "OpenSauce — a modern Rust coding agent in your terminal. Powered By Vexify."
+license = "Apache-2.0"
+rust-version = "1.92"
+
+[[bin]]
+name = "opensauce"
+path = "src/main.rs"
+
+[lib]
+name = "opensauce"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "process", "fs", "sync"] }
+futures-util = "0.3"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# HTTP / LLM streaming
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Errors / helpers
+anyhow = "1"
+thiserror = "2"
+dirs = "5"
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Search (globs)
+globset = "0.4"
+regex = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
