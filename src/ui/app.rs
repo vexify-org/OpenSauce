@@ -97,13 +97,9 @@ pub async fn run_tui(config: Config) -> Result<()> {
 
     // Provider selection
     let (provider, model): (Arc<dyn Provider>, String) = if config.has_real_api() {
-        match OpenAIClient::from_env() {
+        match OpenAIClient::from_config(&config) {
             Some(c) => {
-                let m = if config.model.is_empty() {
-                    c.default_model().to_string()
-                } else {
-                    config.model.clone()
-                };
+                let m = c.resolved_model().to_string();
                 (Arc::new(c), m)
             }
             None => (Arc::new(MockProvider::new()), "mock".into()),

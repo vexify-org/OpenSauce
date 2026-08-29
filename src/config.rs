@@ -70,12 +70,9 @@ impl Config {
         self
     }
 
-    /// Decide whether a real provider is available.
+    /// Decide whether a real provider is available (env or saved connection).
     pub fn has_real_api(&self) -> bool {
-        std::env::var("OPENSAUCE_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .map(|k| !k.is_empty())
-            .unwrap_or(false)
+        crate::connect::has_api_key()
     }
 }
 

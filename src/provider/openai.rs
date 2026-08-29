@@ -40,6 +40,47 @@ impl OpenAIClient {
         })
     }
 
+    /// Build the client from the saved connection profile (created by
+    /// `opensauce connect`), falling back to environment variables. Returns
+    /// `None` when no API key is configured anywhere.
+    pub fn from_config(config: &crate::config::Config) -> Option<Self> {
+        let conn = crate::connect::load();
+        let base = conn
+            .as_ref()
+            .map(|c| c.base_url.clone())
+            .filter(|b| !b.trim().is_empty())
+            .or_else(|| std::env::var("OPENSAUCE_BASE_URL").ok())
+            .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let key = conn
+            .as_ref()
+            .map(|c| c.api_key.clone())
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| std::env::var("OPENSAUCE_API_KEY").ok())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            .filter(|k| !k.trim().is_empty())?;
+        let model = if !config.model.is_empty() {
+            config.model.clone()
+        } else {
+            conn.as_ref()
+                .map(|c| c.model.clone())
+                .filter(|m| !m.trim().is_empty())
+                .or_else(|| std::env::var("OPENSAUCE_MODEL").ok())
+                .unwrap_or_else(|| "gpt-4o-mini".to_string())
+        };
+        Some(OpenAIClient {
+            base_url: base.trim_end_matches('/').to_string(),
+            api_key: Some(key),
+            model,
+            http: Some(client()),
+        })
+    }
+
+    /// The resolved model name (config → connection → env → default).
+    pub fn resolved_model(&self) -> &str {
+        &self.model
+    }
+
     pub fn with_http(mut self, http: reqwest::Client) -> Self {
         self.http = Some(http);
         self

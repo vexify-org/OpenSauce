@@ -39,6 +39,9 @@ enum Command {
     },
     /// List stored sessions.
     Sessions,
+    /// Interactively configure a model provider (name / API key / base URL /
+    /// model), saved without editing any config file by hand.
+    Connect,
 }
 
 #[tokio::main]
@@ -76,6 +79,7 @@ async fn main() {
             })
         }
         Some(Command::Sessions) => list_sessions().map(|_| 0),
+        Some(Command::Connect) => connect().await.map(|_| 0),
         None => opensauce::ui::run_tui(config).await.map(|_| 0),
     };
 
@@ -87,8 +91,8 @@ async fn run_headless(config: &Config, prompt: &str) -> anyhow::Result<String> {
     let tools = ToolRegistry::new(root);
 
     let (provider, model): (std::sync::Arc<dyn Provider>, String) = if config.has_real_api() {
-        let c = OpenAIClient::from_env().ok_or_else(|| anyhow::anyhow!("api key set but client failed to init"))?;
-        let m = if config.model.is_empty() { c.default_model().to_string() } else { config.model.clone() };
+        let c = OpenAIClient::from_config(config).ok_or_else(|| anyhow::anyhow!("api key set but client failed to init"))?;
+        let m = c.resolved_model().to_string();
         (std::sync::Arc::new(c), m)
     } else {
         (std::sync::Arc::new(MockProvider::new()), "mock".into())
@@ -118,5 +122,20 @@ fn list_sessions() -> anyhow::Result<()> {
     for id in &ids {
         println!("{id}");
     }
+    Ok(())
+}
+
+async fn connect() -> anyhow::Result<()> {
+    let conn = opensauce::connect::run_wizard().await?;
+    opensauce::connect::save(&conn)?;
+    let path = opensauce::connect::connection_path();
+    println!(
+        "✓ 已保存连接：{} @ {}（模型 {}）\n配置文件：{}",
+        conn.name,
+        conn.base_url,
+        if conn.model.is_empty() { "(自动)" } else { &conn.model },
+        path.display()
+    );
+    println!("现在直接运行 `opensauce` 即可使用该连接。");
     Ok(())
 }

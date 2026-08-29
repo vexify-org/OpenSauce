@@ -1,4 +1,5 @@
 pub mod config;
+pub mod connect;
 pub mod core;
 pub mod mode;
 pub mod permission;

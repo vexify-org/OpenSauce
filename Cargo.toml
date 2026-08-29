@@ -41,6 +41,9 @@ async-trait = "0.1"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
+# Interactive connection wizard (opensauce connect)
+inquire = "0.7"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
