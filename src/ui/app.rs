@@ -366,6 +366,21 @@ impl App {
             None
         }
     }
+    pub fn sidebar_open(&self) -> bool {
+        self.sidebar_open
+    }
+    pub fn details(&self) -> bool {
+        self.details
+    }
+    pub fn model_label(&self) -> &str {
+        &self.model
+    }
+    pub fn provider_label(&self) -> &'static str {
+        self.provider.name()
+    }
+    pub fn is_thinking(&self) -> bool {
+        self.thinking
+    }
 
     async fn submit(&mut self) -> Result<()> {
         let text = self.input.trim_end().to_string();
