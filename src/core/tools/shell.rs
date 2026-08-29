@@ -90,6 +90,21 @@ impl Tool for RunCommand {
     }
 }
 
+/// Run a command synchronously and return its output as a [`ToolOutput`].
+/// Used by the `!shell` shortcut so the UI can attach command output to the
+/// conversation without going through the async agent loop.
+pub fn run_plain(root: &PathBuf, command: &str) -> Result<ToolOutput> {
+    let output = exec(root, command, 30_000)?;
+    let mut text = String::new();
+    if output.code != 0 {
+        text.push_str(&format!("[exit {}]\n", output.code));
+    }
+    text.push_str(&output.combined);
+    text.push_str(&truncate_marker(output.truncated));
+    let ok = output.code == 0;
+    Ok(if ok { ToolOutput::ok(text) } else { ToolOutput::err(text) })
+}
+
 struct CmdOutput {
     code: i32,
     combined: String,

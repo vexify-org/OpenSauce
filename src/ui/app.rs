@@ -75,7 +75,8 @@ pub struct App {
     abort: Option<tokio::task::AbortHandle>,
     sidebar_open: bool,
     details: bool,
-    last_undo: usize,
+    undo_buf: Vec<Message>,
+    redo_buf: Vec<Message>,
 }
 
 pub async fn run_tui(config: Config) -> Result<()> {
@@ -134,7 +135,8 @@ pub async fn run_tui(config: Config) -> Result<()> {
         abort: None,
         sidebar_open: false,
         details: false,
-        last_undo: 0,
+        undo_buf: Vec::new(),
+        redo_buf: Vec::new(),
     };
 
     let mut terminal = init_terminal()?;
@@ -226,7 +228,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         Some(Action::InputNewline) => app.input.push('\n'),
         Some(Action::InputClear) => app.input.clear(),
         Some(Action::Undo) => app.undo(),
-        Some(Action::Redo) => {}
+        Some(Action::Redo) => app.redo(),
         _ => {
             default_text_input(app, key);
         }
@@ -268,12 +270,14 @@ impl App {
         }
         // `!shell` shortcut — run a command and attach its output.
         if let Some(stripped) = text.trim_start().strip_prefix('!') {
+            self.redo_buf.clear();
             self.run_bash(stripped.trim());
             return Ok(());
         }
         // `@file` references are expanded into the message.
         let expanded = self.expand_references(&text);
         let shared = self.shared.clone();
+        self.redo_buf.clear();
         {
             let mut conv = shared.lock_conv_mut();
             conv.push(Message::user(expanded));
@@ -440,6 +444,8 @@ impl App {
         );
         drop(conv);
         self.input.clear();
+        self.undo_buf.clear();
+        self.redo_buf.clear();
         {
             let mut t = self.todos.lock().unwrap();
             t.clear();
@@ -458,20 +464,32 @@ impl App {
     fn undo(&mut self) {
         let mut conv = self.shared.lock_conv_mut();
         if conv.messages.len() > 1 {
-            self.last_undo = conv.messages.last().map(|m| m.seq).unwrap_or(0) as usize;
-            conv.messages.pop();
+            if let Some(m) = conv.messages.pop() {
+                self.redo_buf.push(m);
+            }
         }
         drop(conv);
         let mut pending = self.shared.pending.lock().unwrap();
         pending.clear();
     }
 
+    fn redo(&mut self) {
+        if let Some(m) = self.redo_buf.pop() {
+            let mut conv = self.shared.lock_conv_mut();
+            conv.push(m);
+            drop(conv);
+            *self.shared.status.lock().unwrap() = "redo".into();
+        } else {
+            self.append_assistant("nothing to redo".into());
+        }
+    }
+
     fn compact(&mut self) {
         // Summarize by trimming the oldest turns, keeping the tail.
         let mut conv = self.shared.lock_conv_mut();
         if conv.messages.len() > 12 {
-            let keep = conv.messages.split_off(conv.messages.len() - 12);
-            conv.messages = keep;
+            let keep_from = conv.messages.len() - 12;
+            conv.messages.drain(..keep_from);
         }
         drop(conv);
         *self.shared.status.lock().unwrap() = "session compacted".into();
@@ -539,7 +557,7 @@ impl App {
         match parts[0] {
             "/help" | "/?" | "/commands" => {
                 self.append_assistant(
-                    "commands:\n  /mode build|plan   switch mode\n  /model <name>      set model\n  /models            list tools/help\n  /new /clear        new session\n  /compact           summarize\n  /sessions          list sessions\n  /undo              undo last turn\n  /redo              (pending)\n  /export            export chat as markdown\n  /editor            compose in $EDITOR\n  /init              rule/todo help\n  /exit /quit        quit\n\nleader (ctrl+x): n new · l sessions · m models · e editor · s status · x export · u undo · c compact · q quit\n  Tab: mode · Esc: interrupt · Ctrl+P: commands"
+                    "commands:\n  /mode build|plan   switch mode\n  /model <name>      set model\n  /models            list tools/help\n  /new /clear        new session\n  /compact           summarize\n  /sessions          list sessions\n  /undo              undo last turn\n  /redo              redo undone turn\n  /export            export chat as markdown\n  /editor            compose in $EDITOR\n  /init              rule/todo help\n  /exit /quit        quit\n\nleader (ctrl+x): n new · l sessions · m models · e editor · s status · x export · u undo · c compact · q quit\n  Tab: mode · Esc: interrupt · Ctrl+P: commands"
                         .into(),
                 );
             }
@@ -565,6 +583,7 @@ impl App {
             "/new" | "/clear" => self.new_session(),
             "/compact" => self.compact(),
             "/undo" => self.undo(),
+            "/redo" => self.redo(),
             "/sessions" => self.list_sessions(),
             "/export" => self.export_session()?,
             "/editor" => self.editor_open()?,
