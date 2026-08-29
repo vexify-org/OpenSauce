@@ -4,6 +4,7 @@ use opensauce::core::message::Message;
 use opensauce::core::session::{Conversation, default_system};
 use opensauce::core::tools::registry::ToolRegistry;
 use opensauce::mode::Mode;
+use opensauce::permission::PermissionHub;
 use opensauce::provider::mock::MockProvider;
 use opensauce::provider::openai::OpenAIClient;
 use opensauce::provider::Provider;
@@ -15,6 +16,10 @@ use opensauce::provider::Provider;
     about = "OpenSauce — a modern Rust coding agent in your terminal. Powered By Vexify."
 )]
 struct Cli {
+    /// Auto-approve all tool permissions (`permission=ask` still prompts with a dialog; this skips it).
+    #[arg(long, global = true)]
+    auto: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -45,6 +50,12 @@ async fn main() {
 
     let cli = Cli::parse();
     let config = Config::load().expect("failed to load config");
+
+    // `--auto` mirrors opencode's auto-approve mode; the hub (TUI + headless)
+    // already honours `OPENCODE_AUTO=1`.
+    if cli.auto {
+        std::env::set_var("OPENCODE_AUTO", "1");
+    }
 
     let exit_code = match cli.command {
         Some(Command::Start { mode }) => {
@@ -85,7 +96,14 @@ async fn run_headless(config: &Config, prompt: &str) -> anyhow::Result<String> {
 
     let mut conv = Conversation::new("headless", "headless", config.mode, default_system(config.mode));
     conv.push(Message::user(prompt));
-    let agent = opensauce::core::agent::Agent::new(provider, std::sync::Arc::new(tools), model);
+    // Headless runs gate tools through the same permission hub as the TUI.
+    let hub = PermissionHub::new(config.permission.clone());
+    if std::env::var("OPENCODE_AUTO").map(|v| v == "1").unwrap_or(false)
+        || std::env::var("OPENSAUCE_AUTO").map(|v| v == "1").unwrap_or(false)
+    {
+        hub.set_auto(true);
+    }
+    let agent = opensauce::core::agent::Agent::new(provider, std::sync::Arc::new(tools), hub, model);
     opensauce::core::agent::run_headless(&agent, &mut conv).await
 }
 

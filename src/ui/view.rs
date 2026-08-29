@@ -8,7 +8,7 @@ use crate::APP_NAME;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -29,6 +29,15 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_messages(f, chunks[1], app, palette);
     draw_input(f, chunks[2], app, palette);
     draw_footer(f, chunks[3], app, palette);
+
+    // Overlays layered on top of the base layout.
+    if app.perm_pending() {
+        if let Some(req) = app.permission_request() {
+            draw_permission_dialog(f, area, &req, palette);
+        }
+    } else if let Some((sel, items)) = app.palette() {
+        draw_palette(f, area, sel, items, palette);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App, p: Palette) {
@@ -153,14 +162,21 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, p: Palette) {
 fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: Palette) {
     let status = app.shared.status_line();
     let mode = app.mode.label();
-    let left = Line::from(vec![
+    let auto = app.is_auto();
+    let mut left = vec![
         Span::styled(" Tab:mode  ", Style::default().fg(p.dim)),
         Span::styled("/exit  ", Style::default().fg(p.dim)),
         Span::styled("/help  ", Style::default().fg(p.dim)),
-        Span::styled(status, Style::default().fg(p.dim)),
-    ]);
+    ];
+    if auto {
+        left.push(Span::styled(
+            "⟳auto  ",
+            Style::default().fg(p.error).add_modifier(Modifier::BOLD),
+        ));
+    }
+    left.push(Span::styled(status, Style::default().fg(p.dim)));
     let right = Line::from(vec![Span::styled(mode, Style::default().fg(p.accent_bright))]);
-    let line = merge_lines(left, right, area.width);
+    let line = merge_lines(Line::from(left), right, area.width);
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -190,4 +206,96 @@ fn header_block(p: Palette) -> Block<'static> {
 
 fn mode_badge_style(_mode: Mode, p: Palette) -> Style {
     Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+}
+
+/// A centered box of the given width/height within `area`.
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let x = area.x.saturating_add(area.width.saturating_sub(w) / 2);
+    let y = area.y.saturating_add(area.height.saturating_sub(h) / 2);
+    Rect { x, y, width: w, height: h }
+}
+
+/// Render the permission dialog overlay (opencode's allow/ask/deny prompt).
+fn draw_permission_dialog(
+    f: &mut Frame,
+    area: Rect,
+    req: &(String, String, String),
+    p: Palette,
+) {
+    let (tool, key, input) = req;
+    let title = format!(" [ permission: {key} ] ");
+    let body = format!(
+        "{tool}\n{}\n\napprove once?  (y/1/Enter/Once)\napprove always?(a/2/Tab/Always)\ndeny                 (n/3/Esc/Reject)",
+        input
+    );
+    let n = body.lines().count() as u16 + 2;
+    let w = (input.len().max(34).max(title.len().max(20)) + 4) as u16;
+    let w = w.min(area.width.saturating_sub(2)).max(20);
+    let box_area = centered(area, w, n.saturating_add(2));
+
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .title(Line::from(vec![Span::styled(
+            title,
+            Style::default().fg(p.accent_bright).add_modifier(Modifier::BOLD),
+        )]));
+    let text = Text::from(
+        body.lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    Line::styled(
+                        format!("{line}"),
+                        Style::default().fg(p.tool).add_modifier(Modifier::BOLD),
+                    )
+                } else if i == 1 {
+                    Line::styled(format!("{line}"), Style::default().fg(p.assistant))
+                } else if line.starts_with("approve once")
+                    || line.starts_with("approve always")
+                    || line.starts_with("deny")
+                {
+                    Line::styled(format!("{line}"), Style::default().fg(p.user))
+                } else {
+                    Line::styled(format!("{line}"), Style::default().fg(p.dim))
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    f.render_widget(
+        Paragraph::new(text).block(block).wrap(Wrap { trim: false }),
+        box_area,
+    );
+}
+
+/// Render the command palette overlay (opencode `ctrl+p`).
+fn draw_palette(f: &mut Frame, area: Rect, sel: usize, items: &[&str], p: Palette) {
+    let h = (items.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let w = items.iter().map(|s| s.len() as u16).max().unwrap_or(10) + 4;
+    let w = w.min(area.width.saturating_sub(2)).max(20);
+    let box_area = centered(area, w, h);
+
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .title(Line::from(vec![Span::styled(
+            " commands ",
+            Style::default().fg(p.accent_bright).add_modifier(Modifier::BOLD),
+        )]));
+    let mut lines = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let prefix = if i == sel { "› " } else { "  " };
+        let line = if i == sel {
+            Line::styled(
+                format!("{prefix}{item}"),
+                Style::default().fg(p.accent_bright).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Line::styled(format!("{prefix}{item}"), Style::default().fg(p.assistant))
+        };
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), box_area);
 }

@@ -4,6 +4,7 @@ use super::message::{Message, Role, ToolCall};
 use super::session::Conversation;
 use super::tools::registry::ToolRegistry;
 use super::tools::{dispatch, ToolOutput};
+use crate::permission::{permission_key, rule_input, PermissionHub};
 use crate::provider::{Provider, ProviderEvent, ToolDef};
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -24,6 +25,13 @@ pub enum AgentEvent {
         name: String,
         ok: bool,
     },
+    /// A tool is waiting on the user to approve (`permission = ask`, or a
+    /// doom-loop). The TUI renders the open request and calls `hub.reply`.
+    PermissionRequest {
+        call_id: String,
+        tool: String,
+        input: String,
+    },
     /// The whole agent run finished.
     Done { usage_prompt: u64, usage_completion: u64 },
 }
@@ -34,15 +42,22 @@ pub type EventSink = Box<dyn FnMut(AgentEvent) + Send>;
 pub struct Agent {
     pub provider: Arc<dyn Provider>,
     pub tools: Arc<ToolRegistry>,
+    pub hub: Arc<PermissionHub>,
     pub model: String,
     pub max_turns: usize,
 }
 
 impl Agent {
-    pub fn new(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>, model: String) -> Self {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        tools: Arc<ToolRegistry>,
+        hub: Arc<PermissionHub>,
+        model: String,
+    ) -> Self {
         Agent {
             provider,
             tools,
+            hub,
             model,
             max_turns: 12,
         }
@@ -123,7 +138,23 @@ impl Agent {
                     name: tc.name.clone(),
                     arguments: tc.arguments.clone(),
                 });
-                let out = dispatch(&self.tools, tc, mode).await;
+                let input = rule_input(&tc.name, &tc.arguments);
+                let key = permission_key(&tc.name);
+                // Let the UI know we may be about to ask (harmless if not).
+                sink(AgentEvent::PermissionRequest {
+                    call_id: tc.id.clone(),
+                    tool: tc.name.clone(),
+                    input: input.clone(),
+                });
+                let approved = self.hub.request(&tc.id, &key, &input).await;
+                let out = if approved {
+                    dispatch(&self.tools, tc, mode).await
+                } else {
+                    ToolOutput::err(format!(
+                        "`{}` was not approved — the model should avoid it.",
+                        tc.name
+                    ))
+                };
                 sink(AgentEvent::ToolCallFinished {
                     name: tc.name.clone(),
                     ok: out.ok,
@@ -177,9 +208,11 @@ mod tests {
 
     #[tokio::test]
     async fn mock_agent_completes_with_tool_loop() {
+        use crate::permission::PermissionConfig;
         let provider = Arc::new(MockProvider::new());
         let tools = Arc::new(ToolRegistry::with_defaults());
-        let agent = Agent::new(provider, tools, "mock".into());
+        let hub = PermissionHub::new(PermissionConfig::default());
+        let agent = Agent::new(provider, tools, hub, "mock".into());
         let mut conv = Conversation::new("t1", "test", Mode::Build, default_system(Mode::Build));
         conv.push(Message::user("tell me about this workspace"));
 

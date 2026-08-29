@@ -9,6 +9,7 @@ use crate::core::session::{Conversation, SessionStore, default_system};
 use crate::core::tools::registry::ToolRegistry;
 use crate::core::tools::todo::{Todo, Todos};
 use crate::mode::Mode;
+use crate::permission::PermissionHub;
 use crate::provider::mock::MockProvider;
 use crate::provider::openai::OpenAIClient;
 use crate::provider::Provider;
@@ -70,11 +71,15 @@ pub struct App {
     todos: Todos,
     root: PathBuf,
     // opencode-style state
+    perm: Arc<PermissionHub>,
+    thinking: bool,
     bindings: Vec<Binding>,
     leader_pending: bool,
     abort: Option<tokio::task::AbortHandle>,
     sidebar_open: bool,
     details: bool,
+    palette_open: bool,
+    palette_index: usize,
     undo_buf: Vec<Message>,
     redo_buf: Vec<Message>,
 }
@@ -83,12 +88,11 @@ pub async fn run_tui(config: Config) -> Result<()> {
     let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let todos = Todo::fresh();
     let tools = Arc::new(ToolRegistry::new_shared(root.clone(), todos.clone()));
-
-    // Permission overrides from config.
-    for (name, rule) in &config.permissions {
-        if rule == "deny" {
-            tools.deny(name);
-        }
+    let perm = PermissionHub::new(config.permission.clone());
+    let auto_from_env = std::env::var("OPENCODE_AUTO").map(|v| v == "1").unwrap_or(false)
+        || std::env::var("OPENSAUCE_AUTO").map(|v| v == "1").unwrap_or(false);
+    if auto_from_env {
+        perm.set_auto(true);
     }
 
     // Provider selection
@@ -130,11 +134,15 @@ pub async fn run_tui(config: Config) -> Result<()> {
         store,
         todos,
         root,
+        perm,
+        thinking: false,
         bindings: keybind::default_bindings(),
         leader_pending: false,
         abort: None,
         sidebar_open: false,
         details: false,
+        palette_open: false,
+        palette_index: 0,
         undo_buf: Vec::new(),
         redo_buf: Vec::new(),
     };
@@ -182,6 +190,15 @@ async fn app_event_loop(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    // While a permission dialog is open, only its three choices matter.
+    if app.perm.has_pending() {
+        return app.handle_permission_key(key);
+    }
+    // While the command palette is open, navigation controls it.
+    if app.palette_open {
+        return app.handle_palette_key(key);
+    }
+
     let Some(chord) = keybind::chord_of(key) else {
         return Ok(false);
     };
@@ -221,7 +238,12 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         Some(Action::HelpShow) => {
             app.run_command("/help")?;
         }
-        Some(Action::CommandList) => app.run_command("/commands")?,
+        Some(Action::CommandList) => app.palette_toggle(),
+        Some(Action::Share) => app.run_command("/share")?,
+        Some(Action::Themes) => app.run_command("/themes")?,
+        Some(Action::Init) => app.run_command("/init")?,
+        Some(Action::Thinking) => app.toggle_thinking(),
+        Some(Action::AutoApprove) => app.toggle_auto(),
         Some(Action::InputSubmit) => {
             app.submit().await?;
         }
@@ -235,6 +257,26 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     }
     Ok(false)
 }
+
+/// Slash commands shown (and runnable) from the command palette (ctrl+p).
+/// Each entry maps directly to a `/…` handler in `App::run_command`.
+pub const PALETTE: &[&str] = &[
+    "/help",
+    "/new",
+    "/compact",
+    "/sessions",
+    "/export",
+    "/model",
+    "/mode",
+    "/undo",
+    "/redo",
+    "/init",
+    "/share",
+    "/permissions",
+    "/thinking",
+    "/themes",
+    "/exit",
+];
 
 fn default_text_input(app: &mut App, key: KeyEvent) {
     use KeyCode::*;
@@ -258,6 +300,77 @@ fn default_text_input(app: &mut App, key: KeyEvent) {
 }
 
 impl App {
+    /// Keys active while a permission dialog is open: approve once / always, reject.
+    fn handle_permission_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if let Some(chord) = keybind::chord_of(key) {
+            if keybind::is_leader(&chord) {
+                self.leader_pending = true;
+                return Ok(false);
+            }
+            if let Some(Action::AppQuit) = keybind::resolve(&self.bindings, chord, false) {
+                self.perm.reject();
+                return Ok(true);
+            }
+        }
+        match key.code {
+            // approve once
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('o') | KeyCode::Char('1')
+            | KeyCode::Enter => self.perm.reply(true, false),
+            // approve always (rest of session)
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2') | KeyCode::Tab => {
+                self.perm.reply(true, true)
+            }
+            // reject
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('r') | KeyCode::Char('R')
+            | KeyCode::Char('3') | KeyCode::Esc => self.perm.reply(false, false),
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Key navigation for the command palette (ctrl+p).
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => self.palette_close(),
+            KeyCode::Down | KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.palette_index = (self.palette_index + 1).min(PALETTE.len().saturating_sub(1));
+            }
+            KeyCode::Down => {
+                self.palette_index = (self.palette_index + 1).min(PALETTE.len().saturating_sub(1))
+            }
+            KeyCode::Up | KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.palette_index = self.palette_index.saturating_sub(1);
+            }
+            KeyCode::Up => self.palette_index = self.palette_index.saturating_sub(1),
+            KeyCode::Enter => {
+                let cmd = PALETTE[self.palette_index].to_string();
+                self.palette_close();
+                self.run_command(&cmd)?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// The open permission request, if any — for the dialog overlay.
+    pub fn permission_request(&self) -> Option<(String, String, String)> {
+        self.perm.pending_request()
+    }
+    pub fn perm_pending(&self) -> bool {
+        self.perm.has_pending()
+    }
+    pub fn is_auto(&self) -> bool {
+        self.perm.is_auto()
+    }
+    /// Palette overlay state: `(selected index, entries)` when open.
+    pub fn palette(&self) -> Option<(usize, &'static [&'static str])> {
+        if self.palette_open {
+            Some((self.palette_index, PALETTE))
+        } else {
+            None
+        }
+    }
+
     async fn submit(&mut self) -> Result<()> {
         let text = self.input.trim_end().to_string();
         self.input.clear();
@@ -369,6 +482,7 @@ impl App {
     fn spawn_agent(&mut self, shared: Arc<Shared>) {
         let provider = self.provider.clone();
         let tools = self.tools.clone();
+        let hub = self.perm.clone();
         let model = self.model.clone();
         let mut store = self.store.clone();
 
@@ -378,7 +492,7 @@ impl App {
 
         let mut mk_sink = make_sink(shared.clone());
         let handle = tokio::spawn(async move {
-            let agent = Agent::new(provider, tools, model);
+            let agent = Agent::new(provider, tools, hub, model);
 
             // Clone the transcript out, run against the copy, then write back
             // so no lock is held across `await`.
@@ -432,6 +546,31 @@ impl App {
             conv.mode = self.mode;
             conv.system = default_system(self.mode);
         }
+    }
+
+    fn toggle_thinking(&mut self) {
+        self.thinking = !self.thinking;
+        *self.shared.status.lock().unwrap() = if self.thinking { "thinking: on" } else { "thinking: off" }.into();
+    }
+
+    fn palette_toggle(&mut self) {
+        if self.palette_open {
+            self.palette_close();
+        } else {
+            self.palette_open = true;
+            self.palette_index = 0;
+        }
+    }
+    fn palette_close(&mut self) {
+        self.palette_open = false;
+    }
+    fn toggle_auto(&mut self) {
+        let on = self.perm.toggle_auto();
+        self.append_assistant(if on {
+            "auto-approve permissions: enabled".into()
+        } else {
+            "auto-approve permissions: disabled".into()
+        });
     }
 
     fn new_session(&mut self) {
@@ -593,6 +732,24 @@ impl App {
                         .into(),
                 );
             }
+            "/share" => {
+                self.append_assistant(
+                    "share — export this conversation as a shareable link/markdown.\n(Coming soon; use /export meanwhile to dump the markdown.)"
+                        .into(),
+                );
+            }
+            "/permissions" => {
+                self.append_permissions();
+            }
+            "/thinking" => {
+                self.toggle_thinking();
+            }
+            "/themes" => {
+                self.append_assistant(format!(
+                    "theme: [{}] — build=blue · plan=yellow.\n`/mode plan` switches to the yellow planning theme.",
+                    self.mode.label()
+                ));
+            }
             "/exit" | "/quit" | "/q" => {
                 use std::process::exit;
                 exit(0);
@@ -607,6 +764,30 @@ impl App {
     fn append_assistant(&mut self, text: String) {
         let mut conv = self.shared.lock_conv_mut();
         conv.push(Message::assistant(text));
+    }
+
+    /// `/permissions` — show configured rules and session-approved inputs.
+    fn append_permissions(&mut self) {
+        let mut text = String::from("permissions:");
+        for rule in &self.perm.cfg.rules {
+            text.push_str(&format!("\n  {:<6} {} @ {}", rule.level.label(), rule.tool, rule.pattern));
+        }
+        let keys = ["bash", "edit", "read", "grep", "glob", "todo", "custom"];
+        let mut has_approved = false;
+        for k in keys {
+            let approved = self.perm.approved(k);
+            if !approved.is_empty() {
+                has_approved = true;
+                for a in approved {
+                    text.push_str(&format!("\n  [allow {}] {} (session)", k, a));
+                }
+            }
+        }
+        if !has_approved {
+            text.push_str("\n  (no session approvals yet)");
+        }
+        text.push_str("\n\nkeys: y/once · a/always · n/reject — `--auto` or OPENCODE_AUTO=1 to approve all");
+        self.append_assistant(text);
     }
 
     fn transcript(&self) -> String {
@@ -648,6 +829,10 @@ fn make_sink(shared: Arc<Shared>) -> impl FnMut() -> Box<dyn FnMut(AgentEvent) +
             }
             AgentEvent::ToolCallQueued { name, .. } => {
                 *s.status.lock().unwrap() = format!("call {name}…");
+            }
+            AgentEvent::PermissionRequest { tool, .. } => {
+                // The dialog state lives in the shared hub; just reflect it.
+                *s.status.lock().unwrap() = format!("permission: {tool}");
             }
             AgentEvent::ToolCallFinished { name, ok } => {
                 *s.status.lock().unwrap() = if ok {

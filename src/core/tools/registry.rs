@@ -28,16 +28,13 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
 }
 
 /// Run a single [`ToolCall`] against the registry.
+///
+/// Permission gating (allow/ask/deny) happens upstream in the agent via
+/// [`crate::permission::PermissionHub`]; this only enforces *read-only* safety
+/// so Plan mode can never mutate the filesystem.
 pub async fn dispatch(reg: &ToolRegistry, call: &ToolCall, mode: Mode) -> ToolOutput {
     match reg.get(&call.name).await {
         Some(tool) => {
-            // Configuration-level deny takes precedence over everything.
-            if reg.is_denied(&call.name) {
-                return ToolOutput::err(format!(
-                    "`{}` is denied by your permission settings.",
-                    call.name
-                ));
-            }
             if !tool.read_only() && !mode.permits_mutation() {
                 return ToolOutput::err(format!(
                     "`{}` is a mutating tool and is blocked in Plan mode. \
@@ -60,21 +57,11 @@ pub type SharedTool = Arc<dyn Tool>;
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, SharedTool>,
-    denied: std::sync::Mutex<HashMap<String, ()>>,
 }
 
 impl ToolRegistry {
     pub fn empty() -> Self {
         Self::default()
-    }
-
-    /// Deny a tool by name (from user permission settings).
-    pub fn deny(&self, name: &str) {
-        self.denied.lock().unwrap().insert(name.to_string(), ());
-    }
-
-    pub fn is_denied(&self, name: &str) -> bool {
-        self.denied.lock().unwrap().contains_key(name)
     }
 
     /// Registry with the built-in tools, rooted at `root`.

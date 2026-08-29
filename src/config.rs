@@ -4,9 +4,9 @@
 //! (or `$XDG_CONFIG_HOME/opensauce/opensauce.toml`) → environment variables.
 
 use crate::mode::Mode;
+use crate::permission::PermissionConfig;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -21,8 +21,9 @@ pub struct Config {
     pub mode: Mode,
     /// Whether to attempt remote (real) models at all.
     pub model_hint: String,
-    /// Per-tool permission overrides: tool name → `allow` | `deny`.
-    pub permissions: HashMap<String, String>,
+    /// Permission rules (opencode `permission` shape: allow/ask/deny + optional
+    /// per-tool granular patterns). Last matching rule wins.
+    pub permission: PermissionConfig,
 }
 
 impl Default for Config {
@@ -32,7 +33,7 @@ impl Default for Config {
             provider: "auto".into(),
             mode: Mode::Build,
             model_hint: String::new(),
-            permissions: HashMap::new(),
+            permission: PermissionConfig::default(),
         }
     }
 }
@@ -57,6 +58,13 @@ impl Config {
         if let Ok(v) = std::env::var("OPENSAUCE_MODE") {
             if let Some(m) = Mode::from_name(&v) {
                 self.mode = m;
+            }
+        }
+        // `OPENCODE_PERMISSION` lets tools like opencode auto-approve everything
+        // (e.g. `{"*":"allow"}`), matching the ecosystem convention.
+        if let Ok(raw) = std::env::var("OPENCODE_PERMISSION") {
+            if let Ok(cfg) = toml::from_str(&format!("permission = {raw}")) {
+                self.permission = cfg;
             }
         }
         self

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod core;
 pub mod mode;
+pub mod permission;
 pub mod provider;
 pub mod theme;
 pub mod ui;

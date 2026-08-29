@@ -23,6 +23,11 @@ pub enum Action {
     ToggleDetails, // show/hide tool detail bodies
     ToggleSidebar,
     HelpShow,
+    Share,
+    Themes,
+    Init,
+    Thinking,
+    AutoApprove,
     InputSubmit,
     InputNewline,
     InputClear,
@@ -87,15 +92,20 @@ pub fn default_bindings() -> Vec<Binding> {
     add(SessionInterrupt, vec![Chord::new(KeyCode::Esc)], vec![]);
     // Models
     add(ModelList, vec![], vec![Chord::new(KeyCode::Char('m'))]);
-    // Agents / modes
-    add(AgentCycle, vec![Chord::new(KeyCode::Tab), Chord::ctrl(KeyCode::Char('m'))], vec![]);
+    // Agents / modes — opencode: ctrl+x a, or Tab to cycle
+    add(AgentCycle, vec![Chord::new(KeyCode::Tab), Chord::ctrl(KeyCode::Char('m'))], vec![Chord::new(KeyCode::Char('a'))]);
+    // App-ish commands
+    add(Share, vec![], vec![Chord::new(KeyCode::Char('s'))]);
+    add(Themes, vec![], vec![Chord::new(KeyCode::Char('t'))]);
+    add(Init, vec![], vec![Chord::new(KeyCode::Char('i'))]);
+    add(HelpShow, vec![], vec![Chord::new(KeyCode::Char('h'))]);
     // Prompt editing
     add(EditorOpen, vec![], vec![Chord::new(KeyCode::Char('e'))]);
     add(InputSubmit, vec![Chord::new(KeyCode::Enter)], vec![]);
     add(InputNewline, vec![Chord::ctrl(KeyCode::Char('j'))], vec![]);
     add(InputClear, vec![Chord::ctrl(KeyCode::Char('u'))], vec![]);
     // Misc
-    add(HelpShow, vec![], vec![Chord::new(KeyCode::Char('h'))]);
+    add(Thinking, vec![], vec![Chord::new(KeyCode::Char('y'))]);
     add(ToggleDetails, vec![], vec![Chord::new(KeyCode::Char('d'))]);
     add(ToggleSidebar, vec![], vec![Chord::new(KeyCode::Char('b'))]);
     add(Undo, vec![], vec![Chord::new(KeyCode::Char('u'))]);
