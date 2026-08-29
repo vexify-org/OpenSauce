@@ -50,6 +50,8 @@ globset = "0.4"
 regex = "1"
 
 [profile.release]
-lto = "thin"
+opt-level = "z"
+lto = "fat"
 strip = true
 codegen-units = 1
+panic = "abort"

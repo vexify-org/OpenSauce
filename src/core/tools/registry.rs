@@ -1,8 +1,10 @@
 //! Tool trait + registry.
 
+use super::edit::EditFile;
 use super::fs::{ListDir, ReadFile, WriteFile, WorkspaceInfo};
-use super::search::{Grep, ListFiles};
+use super::search::{GlobFiles, Grep, ListFiles};
 use super::shell::RunCommand;
+use super::todo::Todo;
 use super::ToolOutput;
 use crate::core::message::ToolCall;
 use crate::mode::Mode;
@@ -29,6 +31,13 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
 pub async fn dispatch(reg: &ToolRegistry, call: &ToolCall, mode: Mode) -> ToolOutput {
     match reg.get(&call.name).await {
         Some(tool) => {
+            // Configuration-level deny takes precedence over everything.
+            if reg.is_denied(&call.name) {
+                return ToolOutput::err(format!(
+                    "`{}` is denied by your permission settings.",
+                    call.name
+                ));
+            }
             if !tool.read_only() && !mode.permits_mutation() {
                 return ToolOutput::err(format!(
                     "`{}` is a mutating tool and is blocked in Plan mode. \
@@ -51,6 +60,7 @@ pub type SharedTool = Arc<dyn Tool>;
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, SharedTool>,
+    denied: std::sync::Mutex<HashMap<String, ()>>,
 }
 
 impl ToolRegistry {
@@ -58,16 +68,44 @@ impl ToolRegistry {
         Self::default()
     }
 
+    /// Deny a tool by name (from user permission settings).
+    pub fn deny(&self, name: &str) {
+        self.denied.lock().unwrap().insert(name.to_string(), ());
+    }
+
+    pub fn is_denied(&self, name: &str) -> bool {
+        self.denied.lock().unwrap().contains_key(name)
+    }
+
     /// Registry with the built-in tools, rooted at `root`.
     pub fn new(root: PathBuf) -> Self {
         let mut r = Self::empty();
         r.register(ReadFile::new(root.clone()));
         r.register(WriteFile::new(root.clone()));
+        r.register(EditFile::new(root.clone()));
         r.register(ListDir::new(root.clone()));
         r.register(WorkspaceInfo::new(root.clone()));
         r.register(Grep::new(root.clone()));
         r.register(ListFiles::new(root.clone()));
-        r.register(RunCommand::new(root));
+        r.register(GlobFiles::new(root.clone()));
+        r.register(RunCommand::new(root.clone()));
+        r.register(Todo::new(Todo::fresh()));
+        r
+    }
+
+    /// Like [`Self::new`] but shares the given session todo store with the UI.
+    pub fn new_shared(root: PathBuf, todos: super::todo::Todos) -> Self {
+        let mut r = Self::empty();
+        r.register(ReadFile::new(root.clone()));
+        r.register(WriteFile::new(root.clone()));
+        r.register(EditFile::new(root.clone()));
+        r.register(ListDir::new(root.clone()));
+        r.register(WorkspaceInfo::new(root.clone()));
+        r.register(Grep::new(root.clone()));
+        r.register(ListFiles::new(root.clone()));
+        r.register(GlobFiles::new(root.clone()));
+        r.register(RunCommand::new(root.clone()));
+        r.register(Todo::new(todos));
         r
     }
 

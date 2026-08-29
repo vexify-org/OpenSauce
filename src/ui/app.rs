@@ -1,11 +1,13 @@
 //! The interactive TUI application: state + event loop + drawing.
 
+use super::keybind::{self, Action, Binding};
 use super::view::draw;
 use crate::config::Config;
 use crate::core::agent::{Agent, AgentEvent};
 use crate::core::message::{Message, Role};
 use crate::core::session::{Conversation, SessionStore, default_system};
 use crate::core::tools::registry::ToolRegistry;
+use crate::core::tools::todo::{Todo, Todos};
 use crate::mode::Mode;
 use crate::provider::mock::MockProvider;
 use crate::provider::openai::OpenAIClient;
@@ -14,6 +16,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::io;
@@ -64,12 +67,28 @@ pub struct App {
     provider: Arc<dyn Provider>,
     model: String,
     store: SessionStore,
-    cmd_mode: String, // "" normal, or temp for command display
+    todos: Todos,
+    root: PathBuf,
+    // opencode-style state
+    bindings: Vec<Binding>,
+    leader_pending: bool,
+    abort: Option<tokio::task::AbortHandle>,
+    sidebar_open: bool,
+    details: bool,
+    last_undo: usize,
 }
 
 pub async fn run_tui(config: Config) -> Result<()> {
     let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let tools = Arc::new(ToolRegistry::new(root));
+    let todos = Todo::fresh();
+    let tools = Arc::new(ToolRegistry::new_shared(root.clone(), todos.clone()));
+
+    // Permission overrides from config.
+    for (name, rule) in &config.permissions {
+        if rule == "deny" {
+            tools.deny(name);
+        }
+    }
 
     // Provider selection
     let (provider, model): (Arc<dyn Provider>, String) = if config.has_real_api() {
@@ -108,7 +127,14 @@ pub async fn run_tui(config: Config) -> Result<()> {
         provider,
         model,
         store,
-        cmd_mode: String::new(),
+        todos,
+        root,
+        bindings: keybind::default_bindings(),
+        leader_pending: false,
+        abort: None,
+        sidebar_open: false,
+        details: false,
+        last_undo: 0,
     };
 
     let mut terminal = init_terminal()?;
@@ -123,8 +149,14 @@ async fn app_event_loop(
 ) -> Result<()> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = std::time::Duration::from_millis(80);
+    let mut leader_armed_at = std::time::Instant::now();
 
     loop {
+        // Leader-key timeout: clear if the follow-up is never pressed.
+        if app.leader_pending && last_tick.duration_since(leader_armed_at) > tick_rate * 5 {
+            app.leader_pending = false;
+        }
+
         terminal.draw(|f| draw(f, app))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -133,6 +165,9 @@ async fn app_event_loop(
                 Event::Key(key) => {
                     if handle_key(app, key).await? {
                         break;
+                    }
+                    if app.leader_pending {
+                        leader_armed_at = std::time::Instant::now();
                     }
                 }
                 Event::Resize(_, _) => {}
@@ -145,68 +180,186 @@ async fn app_event_loop(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
-    use KeyCode::*;
-    // Global quit
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == Char('c') {
-        return Ok(true);
-    }
-    if key.code == Esc {
-        return Ok(true);
-    }
+    let Some(chord) = keybind::chord_of(key) else {
+        return Ok(false);
+    };
 
-    // Slash commands (enter to submit)
-    if !app.input.is_empty() && app.input.starts_with('/') && key.code == Enter {
-        app.submit().await?;
+    // Start a leader sequence.
+    if keybind::is_leader(&chord) && !app.leader_pending {
+        app.leader_pending = true;
         return Ok(false);
     }
 
-    match key.code {
-        Char(c) if !app.shared.is_streaming()
-            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            app.input.push(c);
+    let action = keybind::resolve(&app.bindings, chord, app.leader_pending);
+    app.leader_pending = false;
+
+    // While the agent is busy, only interrupt / quit are honoured.
+    if app.shared.is_streaming() {
+        match action {
+            Some(Action::SessionInterrupt) => {
+                app.abort();
+            }
+            Some(Action::AppQuit) => return Ok(true),
+            _ => {}
         }
+        return Ok(false);
+    }
+
+    match action {
+        Some(Action::AppQuit) => return Ok(true),
+        Some(Action::SessionNew) => app.new_session(),
+        Some(Action::SessionList) => app.list_sessions(),
+        Some(Action::SessionExport) => app.export_session()?,
+        Some(Action::SessionCompact) => app.compact(),
+        Some(Action::ModelList) => app.show_models(),
+        Some(Action::AgentCycle) => app.toggle_mode(),
+        Some(Action::EditorOpen) => app.editor_open()?,
+        Some(Action::ToggleSidebar) => app.toggle_sidebar(),
+        Some(Action::ToggleDetails) => app.toggle_details(),
+        Some(Action::HelpShow) => {
+            app.run_command("/help")?;
+        }
+        Some(Action::CommandList) => app.run_command("/commands")?,
+        Some(Action::InputSubmit) => {
+            app.submit().await?;
+        }
+        Some(Action::InputNewline) => app.input.push('\n'),
+        Some(Action::InputClear) => app.input.clear(),
+        Some(Action::Undo) => app.undo(),
+        Some(Action::Redo) => {}
+        _ => {
+            default_text_input(app, key);
+        }
+    }
+    Ok(false)
+}
+
+fn default_text_input(app: &mut App, key: KeyEvent) {
+    use KeyCode::*;
+    match key.code {
+        Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => app.input.push(c),
         Backspace => {
             app.input.pop();
         }
         Delete => {
             app.input.pop();
         }
-        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.input.clear();
+        Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            while let Some(c) = app.input.pop() {
+                if c == ' ' || c == '\n' {
+                    break;
+                }
+            }
         }
-        Enter => {
-            app.submit().await?;
-        }
-        Tab | Char('M') => {
-            app.toggle_mode();
-        }
-        Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => app.new_session(),
         _ => {}
     }
-    Ok(false)
 }
 
 impl App {
     async fn submit(&mut self) -> Result<()> {
-        {
-            let text = self.input.trim().to_string();
-            self.input.clear();
-            if text.is_empty() {
-                return Ok(());
-            }
-            if text.starts_with('/') {
-                return self.run_command(&text);
-            }
-            // Commit the prompt and kick off the agent.
-            let shared = self.shared.clone();
-            {
-                let mut conv = shared.lock_conv_mut();
-                conv.push(Message::user(text));
-            }
-            self.spawn_agent(shared);
+        let text = self.input.trim_end().to_string();
+        self.input.clear();
+        if text.trim().is_empty() {
+            return Ok(());
         }
+        // `/command`
+        if text.trim().starts_with('/') {
+            return self.run_command(text.trim());
+        }
+        // `!shell` shortcut — run a command and attach its output.
+        if let Some(stripped) = text.trim_start().strip_prefix('!') {
+            self.run_bash(stripped.trim());
+            return Ok(());
+        }
+        // `@file` references are expanded into the message.
+        let expanded = self.expand_references(&text);
+        let shared = self.shared.clone();
+        {
+            let mut conv = shared.lock_conv_mut();
+            conv.push(Message::user(expanded));
+        }
+        self.spawn_agent(shared);
         Ok(())
+    }
+
+    /// Resolve `@path` tokens to real files (opencode-style file references).
+    fn expand_references(&self, text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(idx) = rest.find('@') {
+            out.push_str(&rest[..idx]);
+            rest = &rest[idx..];
+            // Take the token until whitespace/comma/EOF.
+            let token_end = rest[1..]
+                .find(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == ']' || c == '"')
+                .map(|i| i + 1)
+                .unwrap_or(rest.len());
+            let tok = &rest[1..token_end];
+            if !tok.is_empty() && !tok.contains('/') && tok.contains('.') {
+                // heuristic bare ref like `src/main.rs`
+            }
+            let cand = tok.trim().trim_end_matches(['.', ',' , ')']);
+            if !cand.is_empty() {
+                let full = self.root.join(cand);
+                if full.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&full) {
+                        out.push_str(&format!("\n@{} →\n```\n{}\n```\n", cand, content.truncate_safe(60_000)));
+                        rest = &rest[token_end..];
+                        continue;
+                    }
+                }
+            }
+            out.push('@');
+            rest = &rest[1..];
+            // continue scanning after the token to avoid re-matching
+            if token_end > 1 {
+                out.push_str(&rest);
+                rest = "";
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn run_bash(&mut self, cmd: &str) {
+        let shared = self.shared.clone();
+        {
+            let mut conv = shared.lock_conv_mut();
+            conv.push(Message::user(format!("!{cmd}")));
+        }
+        self.spawn_bash(shared, cmd.to_string());
+    }
+
+    fn spawn_bash(&self, shared: Arc<Shared>, cmd: String) {
+        let root = self.root.clone();
+        shared.set_streaming(true);
+        *shared.status.lock().unwrap() = format!("$ {cmd}");
+        let mut mk_sink = make_sink(shared.clone());
+        tokio::spawn(async move {
+            let mut sink = mk_sink();
+            let mut working = shared.lock_conv_mut().clone();
+            match crate::core::tools::shell::run_plain(&root, &cmd) {
+                Ok(out) => {
+                    sink(crate::core::agent::AgentEvent::ToolCallFinished {
+                        name: "bash".into(),
+                        ok: out.ok,
+                    });
+                    let m = crate::core::message::ToolResult {
+                        call_id: format!("bash-{}", crate::core::message::now_millis()),
+                        name: "bash".into(),
+                        success: out.ok,
+                        content: out.text,
+                    };
+                    working.push(Message::from_tool_result(m));
+                }
+                Err(e) => {
+                    *shared.error.lock().unwrap() = Some(e.to_string());
+                }
+            }
+            *shared.lock_conv_mut() = working;
+            shared.set_streaming(false);
+            *shared.status.lock().unwrap() = "ready".into();
+        });
     }
 
     fn spawn_agent(&mut self, shared: Arc<Shared>) {
@@ -220,7 +373,7 @@ impl App {
         *shared.error.lock().unwrap() = None;
 
         let mut mk_sink = make_sink(shared.clone());
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let agent = Agent::new(provider, tools, model);
 
             // Clone the transcript out, run against the copy, then write back
@@ -244,6 +397,25 @@ impl App {
                 *shared.status.lock().unwrap() = "ready".into();
             }
         });
+        self.abort.replace(handle.abort_handle());
+    }
+
+    /// Interrupt the in-flight generation, keeping whatever streamed so far.
+    fn abort(&mut self) {
+        if let Some(h) = self.abort.take() {
+            h.abort();
+        }
+        self.shared.set_streaming(false);
+        {
+            // Commit any pending streamed text as a partial assistant reply.
+            let partial = self.shared.pending();
+            if !partial.is_empty() {
+                let mut conv = self.shared.lock_conv_mut();
+                conv.push(Message::assistant(partial));
+            }
+            *self.shared.pending.lock().unwrap() = String::new();
+        }
+        *self.shared.status.lock().unwrap() = "interrupted".into();
     }
 
     fn toggle_mode(&mut self) {
@@ -251,7 +423,6 @@ impl App {
             Mode::Build => Mode::Plan,
             Mode::Plan => Mode::Build,
         };
-        // Reflect mode in conversation's system prompt for future runs.
         {
             let mut conv = self.shared.lock_conv_mut();
             conv.mode = self.mode;
@@ -260,31 +431,117 @@ impl App {
     }
 
     fn new_session(&mut self) {
-        {
-            let mut conv = self.shared.lock_conv_mut();
-            *conv = Conversation::new(
-                format!("s-{}", crate::core::message::now_millis()),
-                "new session",
-                self.mode,
-                default_system(self.mode),
-            );
-        }
+        let mut conv = self.shared.lock_conv_mut();
+        *conv = Conversation::new(
+            format!("s-{}", crate::core::message::now_millis()),
+            "new session",
+            self.mode,
+            default_system(self.mode),
+        );
+        drop(conv);
         self.input.clear();
+        {
+            let mut t = self.todos.lock().unwrap();
+            t.clear();
+        }
         *self.shared.status.lock().unwrap() = "new session".into();
     }
 
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+    }
+
+    fn toggle_details(&mut self) {
+        self.details = !self.details;
+    }
+
+    fn undo(&mut self) {
+        let mut conv = self.shared.lock_conv_mut();
+        if conv.messages.len() > 1 {
+            self.last_undo = conv.messages.last().map(|m| m.seq).unwrap_or(0) as usize;
+            conv.messages.pop();
+        }
+        drop(conv);
+        let mut pending = self.shared.pending.lock().unwrap();
+        pending.clear();
+    }
+
+    fn compact(&mut self) {
+        // Summarize by trimming the oldest turns, keeping the tail.
+        let mut conv = self.shared.lock_conv_mut();
+        if conv.messages.len() > 12 {
+            let keep = conv.messages.split_off(conv.messages.len() - 12);
+            conv.messages = keep;
+        }
+        drop(conv);
+        *self.shared.status.lock().unwrap() = "session compacted".into();
+    }
+
+    fn list_sessions(&mut self) {
+        let ids = self.store.list().unwrap_or_default();
+        if ids.is_empty() {
+            self.append_assistant("no sessions yet".into());
+            return;
+        }
+        let mut text = String::from("sessions:");
+        for id in ids.iter().take(20) {
+            let t = self
+                .store
+                .load(id)
+                .map(|c| c.title)
+                .unwrap_or_else(|_| id.clone());
+            text.push_str(&format!("\n  • {t}  ({id})"));
+        }
+        self.append_assistant(text);
+    }
+
+    fn show_models(&mut self) {
+        let names = self.tools.names();
+        let mut text = format!("model: {}\nprovider tools:\n", self.model);
+        for n in names {
+            text.push_str(&format!("  • {n}\n"));
+        }
+        text.push_str("\nset a model with `/model <name>` or env OPENSAUCE_MODEL.");
+        self.append_assistant(text.trim_end().to_string());
+    }
+
+    /// Edit the prompt in the user's `$EDITOR`.
+    fn editor_open(&mut self) -> Result<()> {
+        let editor = std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "vi".into());
+        let tmp = std::env::temp_dir().join("opensauce-prompt.txt");
+        std::fs::write(&tmp, &self.input)?;
+        let status = std::process::Command::new(editor)
+            .arg(&tmp)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to open editor: {e}"))?;
+        if status.success() {
+            self.input = std::fs::read_to_string(&tmp).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    fn export_session(&mut self) -> Result<()> {
+        let md = self.transcript();
+        let path = std::env::temp_dir().join(format!("opensauce-{}.md", crate::core::message::now_millis()));
+        std::fs::write(&path, md)?;
+        self.append_assistant(format!("exported to {}", path.display()));
+        Ok(())
+    }
+
     fn run_command(&mut self, cmd: &str) -> Result<()> {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let trimmed = cmd.trim();
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.is_empty() {
             return Ok(());
         }
         match parts[0] {
-            "/help" | "/?" => {
-                self.cmd_mode = "/help".into();
-                let text = format!(
-                    "commands:\n  /mode build|plan   switch conversation mode\n  /model <name>      set model\n  /new               start a fresh session\n  /exit               quit\nkeys:\n  Tab  toggle Build/Plan   Ctrl+C quit"
+            "/help" | "/?" | "/commands" => {
+                self.append_assistant(
+                    "commands:\n  /mode build|plan   switch mode\n  /model <name>      set model\n  /models            list tools/help\n  /new /clear        new session\n  /compact           summarize\n  /sessions          list sessions\n  /undo              undo last turn\n  /redo              (pending)\n  /export            export chat as markdown\n  /editor            compose in $EDITOR\n  /init              rule/todo help\n  /exit /quit        quit\n\nleader (ctrl+x): n new · l sessions · m models · e editor · s status · x export · u undo · c compact · q quit\n  Tab: mode · Esc: interrupt · Ctrl+P: commands"
+                        .into(),
                 );
-                self.append_assistant(text);
             }
             "/mode" => {
                 if let Some(m) = parts.get(1).and_then(|m| Mode::from_name(m)) {
@@ -304,8 +561,20 @@ impl App {
                     self.append_assistant(format!("model: {}", self.model));
                 }
             }
-            "/new" => self.new_session(),
-            "/exit" | "/quit" => {
+            "/models" => self.show_models(),
+            "/new" | "/clear" => self.new_session(),
+            "/compact" => self.compact(),
+            "/undo" => self.undo(),
+            "/sessions" => self.list_sessions(),
+            "/export" => self.export_session()?,
+            "/editor" => self.editor_open()?,
+            "/init" => {
+                self.append_assistant(
+                    "Opensauce follows AGENTS/rules from project files when present. Create a `AGENTS.md` at the repo root to steer the agent.\n\nTip: to plan work, switch to Plan (yellow) mode and let the agent propose tasks before Build."
+                        .into(),
+                );
+            }
+            "/exit" | "/quit" | "/q" => {
                 use std::process::exit;
                 exit(0);
             }
@@ -321,21 +590,32 @@ impl App {
         conv.push(Message::assistant(text));
     }
 
-    /// Ready-made transcript copy for potential future use (e.g. /save).
-    #[allow(dead_code)]
     fn transcript(&self) -> String {
         let conv = self.shared.lock_conv();
         let mut lines = Vec::new();
         for m in conv.turns() {
             let who = match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
+                Role::User => "you",
+                Role::Assistant => "opencode",
                 Role::Tool => "tool",
                 Role::System => "system",
             };
-            lines.push(format!("[{who}] {}", m.display_text()));
+            lines.push(format!("### {who}\n{}", m.display_text()));
         }
-        lines.join("\n")
+        lines.join("\n\n")
+    }
+}
+
+trait Truncate {
+    fn truncate_safe(self, n: usize) -> String;
+}
+impl Truncate for String {
+    fn truncate_safe(mut self, n: usize) -> String {
+        if self.len() > n {
+            self.truncate(n);
+            self.push_str("\n… [truncated]");
+        }
+        self
     }
 }
 

@@ -1,9 +1,11 @@
 //! Tool framework.
 
+pub mod edit;
 pub mod fs;
 pub mod registry;
 pub mod search;
 pub mod shell;
+pub mod todo;
 
 pub use registry::{dispatch, Tool, ToolRegistry};
 

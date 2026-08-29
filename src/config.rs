@@ -6,6 +6,7 @@
 use crate::mode::Mode;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -20,6 +21,8 @@ pub struct Config {
     pub mode: Mode,
     /// Whether to attempt remote (real) models at all.
     pub model_hint: String,
+    /// Per-tool permission overrides: tool name → `allow` | `deny`.
+    pub permissions: HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -29,6 +32,7 @@ impl Default for Config {
             provider: "auto".into(),
             mode: Mode::Build,
             model_hint: String::new(),
+            permissions: HashMap::new(),
         }
     }
 }

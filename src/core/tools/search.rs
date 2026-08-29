@@ -198,6 +198,83 @@ impl Tool for ListFiles {
     }
 }
 
+/// `glob` — find files/dirs matching a glob, relative to the workspace root.
+#[derive(Debug)]
+pub struct GlobFiles {
+    pub root: PathBuf,
+}
+
+impl GlobFiles {
+    pub fn new(root: PathBuf) -> Self {
+        GlobFiles { root }
+    }
+}
+
+impl Tool for GlobFiles {
+    fn name(&self) -> &'static str {
+        "glob"
+    }
+    fn description(&self) -> &'static str {
+        "Find files matching a glob pattern (e.g. `src/**/*.rs`), up to 200 matches."
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob to match against paths relative to the workspace root."},
+                "base": {"type": "string", "description": "Optional directory to search from (default root)."}
+            },
+            "required": ["pattern"],
+            "additionalProperties": false,
+        })
+    }
+    fn run(&self, args: serde_json::Value, _mode: Mode) -> Result<ToolOutput> {
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("`pattern` is required"))?;
+        let base = args.get("base").and_then(|v| v.as_str()).unwrap_or(".");
+        let dir = self.root.join(base);
+        let pattern = pattern.trim_start_matches('/').to_string();
+        let matcher = build_include_matcher(&[pattern]);
+
+        let mut out = Vec::new();
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if let Ok(ft) = e.file_type() {
+                        if ft.is_dir() {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if name.starts_with('.') || name == "target" || name == ".git" || name == "node_modules" {
+                                continue;
+                            }
+                            stack.push(p);
+                        } else if matcher.is_match(rel_path(&p, &self.root)) {
+                            out.push(rel_path(&p, &self.root));
+                        }
+                    }
+                    if out.len() >= 200 {
+                        break;
+                    }
+                }
+            }
+            if out.len() >= 200 {
+                break;
+            }
+        }
+        out.sort();
+        if out.is_empty() {
+            bail!("no matches for pattern {}", args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""));
+        }
+        Ok(ToolOutput::ok(out.join("\n")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
