@@ -1,0 +1,67 @@
+# Release build for OpenSauce
+#
+# Triggered by pushing a tag like `v1.1.0`. Builds release binaries for the
+# supported platforms and uploads them as release assets named exactly like
+# `install.sh` expects:
+#   opensauce-<platform>-<version>   e.g. opensauce-linux-x86_64-1.1.0
+#
+# Platforms (from install.sh `platform()`): linux-x86_64, linux-aarch64,
+# darwin-x86_64, darwin-aarch64.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            plat: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            plat: linux-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            plat: darwin-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            plat: darwin-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Version from tag
+        id: v
+        run: echo "ver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage asset
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/opensauce" \
+             "staging/opensauce-${{ matrix.plat }}-${{ steps.v.outputs.ver }}"
+          chmod +x "staging/opensauce-${{ matrix.plat }}-${{ steps.v.outputs.ver }}"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: staging/*
+          name: v${{ steps.v.outputs.ver }}
+          generate_release_notes: true
