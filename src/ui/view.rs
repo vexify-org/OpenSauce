@@ -35,9 +35,30 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Sidebar width (opencode `width={42}`).
 const SIDEBAR_W: u16 = 42;
-/// Prompt zone height: 4 for the bordered box (blank, input, blank, meta),
-/// 1 for the `╹▀` curve row, 1 for the status row.
-const PROMPT_ZONE_H: u16 = 6;
+/// Maximum prompt lines rendered before the box windows around the caret.
+const MAX_PROMPT_LINES: usize = 8;
+/// Maximum rows the completion menu shows at once.
+const MAX_MENU_ROWS: usize = 6;
+
+/// Height of the prompt box: a blank pad row, the input lines, a blank gap and
+/// the meta row — so `lines + 3`. Grows with the prompt, capped at
+/// [`MAX_PROMPT_LINES`].
+fn prompt_box_height(app: &App) -> u16 {
+    let lines = app.input.split('\n').count().min(MAX_PROMPT_LINES).max(1);
+    lines as u16 + 3
+}
+
+/// Rows the completion menu currently needs (0 when closed).
+fn completion_rows(app: &App) -> u16 {
+    app.completion_state()
+        .map(|(c, _)| c.len().min(MAX_MENU_ROWS) as u16)
+        .unwrap_or(0)
+}
+
+/// Total height of the prompt zone: menu + box + `╹▀` curve + status row.
+fn prompt_zone_height(app: &App) -> u16 {
+    completion_rows(app) + prompt_box_height(app) + 2
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let palette = Palette::for_mode(app.mode);
@@ -69,9 +90,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         vertical: 0,
     });
 
+    // The prompt zone grows with the menu, the prompt lines and the curve.
+    let zone_h = prompt_zone_height(app).min(body.height.saturating_sub(5));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(PROMPT_ZONE_H)])
+        .constraints([Constraint::Min(5), Constraint::Length(zone_h)])
         .split(body);
 
     draw_messages(f, rows[0], app, palette);
@@ -80,7 +103,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Some(sb) = sidebar {
         draw_sidebar(f, sb, app, palette);
     }
-    draw_footer(f, footer_area, palette);
+    draw_footer(f, footer_area, app, palette);
 
     // Overlays layered on top of the base layout.
     if app.perm_pending() {
@@ -92,19 +115,36 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-/// The prompt box + its `╹▀` curve + the status row.
+/// The completion menu + prompt box + its `╹▀` curve + the status row.
 fn draw_prompt_zone(f: &mut Frame, area: Rect, app: &App, p: Palette) {
+    let menu_h = completion_rows(app).min(area.height);
+    let box_h = prompt_box_height(app).min(area.height.saturating_sub(menu_h + 2));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(menu_h),
+            Constraint::Length(box_h),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
-    draw_prompt_box(f, rows[0], app, p);
-    draw_prompt_curve(f, rows[1], p);
-    draw_status(f, rows[2], app, p);
+    if menu_h > 0 {
+        draw_completion_menu(f, rows[0], app, p);
+    }
+    draw_prompt_box(f, rows[1], app, p);
+    draw_prompt_curve(f, rows[2], p);
+    draw_status(f, rows[3], app, p);
+}
+
+/// Render one single-row line over the element background.
+fn render_row(f: &mut Frame, area: Rect, y: u16, line: Line<'static>, bg: ratatui::style::Color) {
+    if y >= area.bottom() {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(bg)),
+        Rect { x: area.x, y, width: area.width, height: 1 },
+    );
 }
 
 /// The accent-left-bordered element pane holding input + meta row.
@@ -113,18 +153,71 @@ fn draw_prompt_box(f: &mut Frame, area: Rect, app: &App, p: Palette) {
         horizontal: 2, // 1 for `┃` border + 1 extra; opencode paddingLeft2
         vertical: 0,
     });
+    let width = text_area.width as usize;
 
-    // Row 0: blank padding. Row 1: input line (placeholder when empty).
-    let input_line = if app.input.is_empty() {
-        Line::from(vec![Span::styled(
-            "What can OpenSauce build for you?",
-            Style::default().fg(p.dim),
-        )])
+    // Caret position: which input line, and the column within it.
+    let chars: Vec<char> = app.input.chars().collect();
+    let cur = app.cursor.min(chars.len());
+    let caret_line = chars[..cur].iter().filter(|c| **c == '\n').count();
+    let caret_col = chars[..cur].iter().rev().take_while(|c| **c != '\n').count();
+    // Horizontal offset so a long line keeps the caret in view.
+    let h_off = caret_col.saturating_sub(width.saturating_sub(1));
+
+    // Left border `┃` in the mode accent.
+    f.render_widget(
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(p.accent)),
+        area,
+    );
+
+    let mut y = text_area.y;
+    render_row(f, text_area, y, Line::raw(""), p.element);
+    y += 1;
+
+    let input_top = y;
+    if app.input.is_empty() {
+        render_row(
+            f,
+            text_area,
+            y,
+            Line::from(vec![Span::styled(
+                "What can OpenSauce build for you?",
+                Style::default().fg(p.dim),
+            )]),
+            p.element,
+        );
+        y += 1;
     } else {
-        Line::from(vec![Span::styled(app.input.as_str(), Style::default().fg(p.text))])
-    };
+        let all: Vec<&str> = app.input.split('\n').collect();
+        let start = if all.len() > MAX_PROMPT_LINES {
+            caret_line
+                .saturating_sub(MAX_PROMPT_LINES - 1)
+                .min(all.len() - MAX_PROMPT_LINES)
+        } else {
+            0
+        };
+        let end = (start + MAX_PROMPT_LINES).min(all.len());
+        for (i, l) in all[start..end].iter().enumerate() {
+            let abs = start + i;
+            let skip = if abs == caret_line { h_off } else { 0 };
+            let visible: String = l.chars().skip(skip).collect();
+            render_row(
+                f,
+                text_area,
+                y,
+                Line::from(vec![Span::styled(visible, Style::default().fg(p.text))]),
+                p.element,
+            );
+            y += 1;
+        }
+    }
 
-    // Row 3: meta — `Mode[ auto] · model provider` left, version right.
+    // Gap row, then the meta row.
+    render_row(f, text_area, y, Line::raw(""), p.element);
+    y += 1;
+
+    // Meta — `Mode[ auto] · model provider` left, version right.
     let mut meta = vec![Span::styled(app.mode.label(), Style::default().fg(p.accent))];
     if app.is_auto() {
         meta.push(Span::styled(" auto", Style::default().fg(p.dim)));
@@ -137,30 +230,55 @@ fn draw_prompt_box(f: &mut Frame, area: Rect, app: &App, p: Palette) {
         Line::from(vec![Span::styled(format!("v{VERSION}"), Style::default().fg(p.dim))]),
         text_area.width.saturating_sub(2),
     );
+    render_row(f, text_area, y, meta_line, p.element);
 
-    // Left border `┃` in the mode accent.
-    f.render_widget(
-        Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(p.accent)),
-        area,
-    );
-
-    let mut y = text_area.y;
-    for line in [Line::raw(""), input_line, Line::raw(""), meta_line] {
-        f.render_widget(
-            Paragraph::new(line).style(Style::default().bg(p.element)),
-            Rect { x: text_area.x, y, width: text_area.width, height: 1 },
-        );
-        y += 1;
-    }
-
-    // Cursor right after the typed text on the input line.
-    let x = text_area.x.saturating_add(app.input.chars().count() as u16);
+    // Caret, positioned on the visible input row/column.
+    let shown_line = caret_line.saturating_sub(if app.input.split('\n').count() > MAX_PROMPT_LINES {
+        caret_line.saturating_sub(MAX_PROMPT_LINES - 1).min(app.input.split('\n').count() - MAX_PROMPT_LINES)
+    } else {
+        0
+    });
+    let cx = text_area.x.saturating_add((caret_col - h_off) as u16);
     f.set_cursor_position(Position::new(
-        x.min(text_area.right().saturating_sub(1)),
-        text_area.y + 1,
+        cx.min(text_area.right().saturating_sub(1)),
+        input_top.saturating_add(shown_line as u16),
     ));
+}
+
+/// The completion menu drawn directly above the prompt box: a `›`-marked list
+/// of slash commands or `@path` matches.
+fn draw_completion_menu(f: &mut Frame, area: Rect, app: &App, p: Palette) {
+    let Some((cands, idx)) = app.completion_state() else {
+        return;
+    };
+    let inner = area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 0 });
+    // Window the list around the selection.
+    let start = if idx >= MAX_MENU_ROWS {
+        idx + 1 - MAX_MENU_ROWS
+    } else {
+        0
+    };
+    let end = (start + MAX_MENU_ROWS).min(cands.len());
+
+    let mut lines = Vec::new();
+    for (i, c) in cands[start..end].iter().enumerate() {
+        let abs = start + i;
+        if abs == idx {
+            lines.push(Line::from(vec![
+                Span::styled("› ", Style::default().fg(p.accent)),
+                Span::styled(c.clone(), Style::default().fg(p.accent_bright).add_modifier(Modifier::BOLD)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(p.dim)),
+                Span::styled(c.clone(), Style::default().fg(p.text)),
+            ]));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(p.element)),
+        inner,
+    );
 }
 
 /// The box `height={1}` below the prompt: left `╹` (accent) with an upper-half
@@ -199,22 +317,33 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, p: Palette) {
 }
 
 /// The full-width bottom footer row (opencode `Footer`): directory left, and
-/// `△ n Permission` / `• n LSP ⊙ n MCP /status` right.
-fn draw_footer(f: &mut Frame, area: Rect, p: Palette) {
+/// `△ n Permission` / `• n LSP ⊙ n MCP /status` right. While the transcript is
+/// scrolled back a `↓ pgdn to bottom` hint takes the right slot.
+fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: Palette) {
     let dir = std::env::current_dir()
         .map(|d| d.display().to_string())
         .unwrap_or_else(|_| ".".into());
     let left = Line::from(vec![Span::styled(dir, Style::default().fg(p.dim))]);
 
-    let right_spans = vec![
-        Span::styled("• ", Style::default().fg(p.success)),
-        Span::styled("0 LSP", Style::default().fg(p.text)),
-        Span::styled("  ", Style::default().fg(p.dim)),
-        Span::styled("⊙ ", Style::default().fg(p.success)),
-        Span::styled("0 MCP", Style::default().fg(p.text)),
-        Span::styled("  ", Style::default().fg(p.dim)),
-        Span::styled("/status", Style::default().fg(p.dim)),
-    ];
+    let right_spans = if app.is_following() {
+        vec![
+            Span::styled("• ", Style::default().fg(p.success)),
+            Span::styled("0 LSP", Style::default().fg(p.text)),
+            Span::styled("  ", Style::default().fg(p.dim)),
+            Span::styled("⊙ ", Style::default().fg(p.success)),
+            Span::styled("0 MCP", Style::default().fg(p.text)),
+            Span::styled("  ", Style::default().fg(p.dim)),
+            Span::styled("/status", Style::default().fg(p.dim)),
+        ]
+    } else {
+        vec![
+            Span::styled("⇡ ", Style::default().fg(p.warning)),
+            Span::styled(format!("{} lines back", app.scroll_back()), Style::default().fg(p.dim)),
+            Span::styled("  ", Style::default().fg(p.dim)),
+            Span::styled("pgdn", Style::default().fg(p.text)),
+            Span::styled(" to bottom", Style::default().fg(p.dim)),
+        ]
+    };
     let right = Line::from(right_spans);
     let line = merge_lines(left, right, area.width.saturating_sub(2));
     f.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), area);
@@ -302,7 +431,14 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App, p: Palette) {
 
     let total = lines.len();
     let view_h = area.height.saturating_sub(1) as usize;
-    let scroll = total.saturating_sub(view_h);
+    let max_scroll = total.saturating_sub(view_h);
+    // Pinned to the newest line while following; otherwise offset back from the
+    // bottom by however far the user scrolled.
+    let scroll = if app.is_following() {
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(app.scroll_back() as usize)
+    };
 
     let text = ratatui::text::Text::from(lines);
     let para = Paragraph::new(text)

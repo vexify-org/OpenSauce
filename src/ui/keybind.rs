@@ -34,6 +34,14 @@ pub enum Action {
     CopyToClipboard,
     Undo,
     Redo,
+    /// Scroll the transcript back towards older turns.
+    ScrollUp,
+    /// Scroll the transcript forwards towards the newest turn.
+    ScrollDown,
+    /// Recall an older prompt from history.
+    HistoryPrev,
+    /// Recall a newer prompt from history.
+    HistoryNext,
 }
 
 /// A single key press, normalized. `via_leader` means it follows the leader.
@@ -52,6 +60,9 @@ impl Chord {
     }
     fn ctrl(key: KeyCode) -> Self {
         Chord { key, ctrl: true, shift: false, alt: false, via_leader: false }
+    }
+    fn shift(key: KeyCode) -> Self {
+        Chord { key, ctrl: false, shift: true, alt: false, via_leader: false }
     }
 }
 
@@ -104,6 +115,19 @@ pub fn default_bindings() -> Vec<Binding> {
     add(InputSubmit, vec![Chord::new(KeyCode::Enter)], vec![]);
     add(InputNewline, vec![Chord::ctrl(KeyCode::Char('j'))], vec![]);
     add(InputClear, vec![Chord::ctrl(KeyCode::Char('u'))], vec![]);
+    // Transcript scrolling + prompt history
+    add(
+        ScrollUp,
+        vec![Chord::new(KeyCode::PageUp), Chord::shift(KeyCode::Up)],
+        vec![],
+    );
+    add(
+        ScrollDown,
+        vec![Chord::new(KeyCode::PageDown), Chord::shift(KeyCode::Down)],
+        vec![],
+    );
+    add(HistoryPrev, vec![Chord::new(KeyCode::Up)], vec![]);
+    add(HistoryNext, vec![Chord::new(KeyCode::Down)], vec![]);
     // Misc
     add(Thinking, vec![], vec![Chord::new(KeyCode::Char('y'))]);
     add(ToggleDetails, vec![], vec![Chord::new(KeyCode::Char('d'))]);

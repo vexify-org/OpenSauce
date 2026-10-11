@@ -63,6 +63,22 @@ impl Shared {
 pub struct App {
     pub shared: Arc<Shared>,
     pub input: String,
+    /// Caret position as a *character* index into `input` (`0..=char_count`).
+    pub cursor: usize,
+    /// Submitted prompts, newest last — recalled with ↑/↓.
+    history: Vec<String>,
+    /// Index into `history` while browsing it (`None` = editing a fresh draft).
+    history_idx: Option<usize>,
+    /// The in-progress draft stashed when history browsing starts.
+    history_draft: String,
+    /// Lines scrolled *up from the bottom* of the transcript.
+    scroll_back: u16,
+    /// When true the transcript is pinned to the newest line.
+    follow: bool,
+    /// Highlighted row in the completion menu.
+    completion_index: usize,
+    /// Suppresses the completion menu until the input next changes.
+    completion_dismissed: bool,
     pub mode: Mode,
     tools: Arc<ToolRegistry>,
     provider: Arc<dyn Provider>,
@@ -123,6 +139,14 @@ pub async fn run_tui(config: Config) -> Result<()> {
     let mut app = App {
         shared,
         input: String::new(),
+        cursor: 0,
+        history: Vec::new(),
+        history_idx: None,
+        history_draft: String::new(),
+        scroll_back: 0,
+        follow: true,
+        completion_index: 0,
+        completion_dismissed: false,
         mode: config.mode,
         tools,
         provider,
@@ -177,6 +201,11 @@ async fn app_event_loop(
                     }
                 }
                 Event::Resize(_, _) => {}
+                Event::Mouse(m) => match m.kind {
+                    crossterm::event::MouseEventKind::ScrollUp => app.scroll_up(3),
+                    crossterm::event::MouseEventKind::ScrollDown => app.scroll_down(3),
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -193,6 +222,28 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     // While the command palette is open, navigation controls it.
     if app.palette_open {
         return app.handle_palette_key(key);
+    }
+    // While a completion menu is open, Tab/Enter accept it and Esc dismisses.
+    if app.completion_state().is_some() {
+        match key.code {
+            KeyCode::Tab | KeyCode::Enter => {
+                app.accept_completion();
+                return Ok(false);
+            }
+            KeyCode::Esc => {
+                app.completion_dismissed = true;
+                return Ok(false);
+            }
+            KeyCode::Up => {
+                app.completion_prev();
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                app.completion_next();
+                return Ok(false);
+            }
+            _ => {}
+        }
     }
 
     let Some(chord) = keybind::chord_of(key) else {
@@ -243,12 +294,16 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         Some(Action::InputSubmit) => {
             app.submit().await?;
         }
-        Some(Action::InputNewline) => app.input.push('\n'),
-        Some(Action::InputClear) => app.input.clear(),
+        Some(Action::InputNewline) => app.insert_str("\n"),
+        Some(Action::InputClear) => app.set_input(String::new()),
+        Some(Action::ScrollUp) => app.scroll_up(5),
+        Some(Action::ScrollDown) => app.scroll_down(5),
+        Some(Action::HistoryPrev) => app.history_prev(),
+        Some(Action::HistoryNext) => app.history_next(),
         Some(Action::Undo) => app.undo(),
         Some(Action::Redo) => app.redo(),
         _ => {
-            default_text_input(app, key);
+            app.edit_key(key);
         }
     }
     Ok(false)
@@ -273,27 +328,6 @@ pub const PALETTE: &[&str] = &[
     "/themes",
     "/exit",
 ];
-
-fn default_text_input(app: &mut App, key: KeyEvent) {
-    use KeyCode::*;
-    match key.code {
-        Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => app.input.push(c),
-        Backspace => {
-            app.input.pop();
-        }
-        Delete => {
-            app.input.pop();
-        }
-        Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            while let Some(c) = app.input.pop() {
-                if c == ' ' || c == '\n' {
-                    break;
-                }
-            }
-        }
-        _ => {}
-    }
-}
 
 impl App {
     /// Keys active while a permission dialog is open: approve once / always, reject.
@@ -382,12 +416,334 @@ impl App {
         self.thinking
     }
 
+    // ---- prompt editing ---------------------------------------------------
+
+    /// Byte offset of character index `n` (clamped to the end of the buffer).
+    fn byte_at(&self, n: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(n)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+
+    /// Replace the whole prompt, moving the caret to the end.
+    pub fn set_input(&mut self, s: String) {
+        self.input = s;
+        self.cursor = self.input.chars().count();
+        self.on_input_changed();
+    }
+
+    /// Insert text at the caret.
+    pub fn insert_str(&mut self, s: &str) {
+        let at = self.byte_at(self.cursor);
+        self.input.insert_str(at, s);
+        self.cursor += s.chars().count();
+        self.on_input_changed();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_at(self.cursor);
+        let start = self.byte_at(self.cursor - 1);
+        self.input.replace_range(start..end, "");
+        self.cursor -= 1;
+        self.on_input_changed();
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.input.chars().count() {
+            return;
+        }
+        let start = self.byte_at(self.cursor);
+        let end = self.byte_at(self.cursor + 1);
+        self.input.replace_range(start..end, "");
+        self.on_input_changed();
+    }
+
+    /// Delete the word before the caret (ctrl+w / alt+backspace).
+    fn delete_word_back(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        let start = self.byte_at(i);
+        let end = self.byte_at(self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor = i;
+        self.on_input_changed();
+    }
+
+    fn move_caret(&mut self, n: usize) {
+        self.cursor = n.min(self.input.chars().count());
+        self.completion_dismissed = false;
+    }
+
+    fn move_word_back(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.move_caret(i);
+    }
+
+    fn move_word_forward(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let n = chars.len();
+        let mut i = self.cursor;
+        while i < n && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.move_caret(i);
+    }
+
+    /// Reset menu state whenever the buffer changes.
+    fn on_input_changed(&mut self) {
+        self.completion_dismissed = false;
+        self.completion_index = 0;
+        // Any edit drops out of history browsing.
+        self.history_idx = None;
+    }
+
+    /// Handle a single editing key: characters, deletion and caret motion.
+    fn edit_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            Char(c) if ctrl || alt => match c {
+                'w' | 'W' => self.delete_word_back(),
+                'a' | 'A' => self.move_caret(0),
+                'e' | 'E' => self.move_caret(self.input.chars().count()),
+                'b' | 'B' => self.move_caret(self.cursor.saturating_sub(1)),
+                'f' | 'F' => self.move_caret(self.cursor + 1),
+                _ => {}
+            },
+            Char(c) => self.insert_str(&c.to_string()),
+            Backspace if ctrl || alt => self.delete_word_back(),
+            Backspace => self.backspace(),
+            Delete => self.delete_forward(),
+            Left if ctrl || alt => self.move_word_back(),
+            Left => self.move_caret(self.cursor.saturating_sub(1)),
+            Right if ctrl || alt => self.move_word_forward(),
+            Right => self.move_caret(self.cursor + 1),
+            Home => self.move_caret(0),
+            End => self.move_caret(self.input.chars().count()),
+            _ => {}
+        }
+    }
+
+    // ---- completion -------------------------------------------------------
+
+    /// The completion candidates for the caret context, if a menu should show.
+    /// Slash commands complete at the start of a prompt; `@path` completes
+    /// against the workspace filesystem.
+    pub fn completions(&self) -> Vec<String> {
+        if self.completion_dismissed {
+            return Vec::new();
+        }
+        let before = &self.input[..self.byte_at(self.cursor)];
+        let token_start = before
+            .rfind(|c: char| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let token = &before[token_start..];
+
+        if self.input.starts_with('/') && !self.input.contains(char::is_whitespace) {
+            let mut v: Vec<String> = PALETTE
+                .iter()
+                .filter(|c| c.starts_with(&self.input))
+                .map(|c| c.to_string())
+                .collect();
+            if v.len() == 1 && v[0] == self.input {
+                v.clear();
+            }
+            return v;
+        }
+
+        if let Some(prefix) = token.strip_prefix('@') {
+            let mut v = self.file_matches(prefix);
+            // An exact match means there is nothing left to complete.
+            if v.len() == 1 && v[0] == prefix {
+                v.clear();
+            }
+            return v;
+        }
+        Vec::new()
+    }
+
+    /// Workspace paths starting with `prefix` (relative, `@`-less).
+    fn file_matches(&self, prefix: &str) -> Vec<String> {
+        let (dir_part, name_part) = match prefix.rfind('/') {
+            Some(i) => (&prefix[..=i], &prefix[i + 1..]),
+            None => ("", prefix),
+        };
+        let base = self.root.join(dir_part);
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') && !name_part.starts_with('.') {
+                continue;
+            }
+            if !name.starts_with(name_part) {
+                continue;
+            }
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            out.push(format!(
+                "{dir_part}{name}{}",
+                if is_dir { "/" } else { "" }
+            ));
+        }
+        out.sort();
+        out.truncate(50);
+        out
+    }
+
+    /// `(candidates, highlighted index)` when a completion menu is visible.
+    pub fn completion_state(&self) -> Option<(Vec<String>, usize)> {
+        let c = self.completions();
+        if c.is_empty() {
+            None
+        } else {
+            let i = self.completion_index.min(c.len() - 1);
+            Some((c, i))
+        }
+    }
+
+    pub fn completion_prev(&mut self) {
+        self.completion_index = self.completion_index.saturating_sub(1);
+    }
+
+    pub fn completion_next(&mut self) {
+        if let Some((c, _)) = self.completion_state() {
+            self.completion_index = (self.completion_index + 1).min(c.len().saturating_sub(1));
+        }
+    }
+
+    /// Splice the highlighted candidate into the prompt.
+    pub fn accept_completion(&mut self) {
+        let Some((cands, idx)) = self.completion_state() else {
+            return;
+        };
+        let choice = cands[idx].clone();
+        let before = &self.input[..self.byte_at(self.cursor)];
+        let token_start = before
+            .rfind(|c: char| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let tail = self.input[self.byte_at(self.cursor)..].to_string();
+        let mut new = String::from(&self.input[..token_start]);
+        // Slash commands keep their own token (no `@` marker).
+        if !choice.starts_with('@') && self.input.starts_with('/') {
+            new.push_str(&choice);
+        } else {
+            new.push('@');
+            new.push_str(&choice);
+        }
+        let caret = new.chars().count();
+        new.push_str(&tail);
+        self.input = new;
+        self.cursor = caret;
+        self.on_input_changed();
+        // A trailing `/` keeps drilling into the directory.
+        if choice.ends_with('/') {
+            self.completion_dismissed = false;
+        }
+    }
+
+    // ---- transcript scrolling ---------------------------------------------
+
+    pub fn is_following(&self) -> bool {
+        self.follow
+    }
+
+    /// Lines scrolled up from the bottom of the transcript.
+    pub fn scroll_back(&self) -> u16 {
+        self.scroll_back
+    }
+
+    pub fn scroll_up(&mut self, n: u16) {
+        self.follow = false;
+        self.scroll_back = self.scroll_back.saturating_add(n);
+    }
+
+    pub fn scroll_down(&mut self, n: u16) {
+        self.scroll_back = self.scroll_back.saturating_sub(n);
+        if self.scroll_back == 0 {
+            self.follow = true;
+        }
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.scroll_back = 0;
+        self.follow = true;
+    }
+
+    // ---- prompt history ---------------------------------------------------
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let idx = match self.history_idx {
+            None => {
+                self.history_draft = self.input.clone();
+                self.history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_idx = Some(idx);
+        let text = self.history[idx].clone();
+        self.set_input(text);
+    }
+
+    fn history_next(&mut self) {
+        let Some(idx) = self.history_idx else {
+            return;
+        };
+        if idx + 1 < self.history.len() {
+            self.history_idx = Some(idx + 1);
+            let text = self.history[idx + 1].clone();
+            self.set_input(text);
+        } else {
+            self.history_idx = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.set_input(draft);
+        }
+    }
+
     async fn submit(&mut self) -> Result<()> {
         let text = self.input.trim_end().to_string();
-        self.input.clear();
+        self.set_input(String::new());
         if text.trim().is_empty() {
             return Ok(());
         }
+        // Remember the prompt for ↑/↓ recall (skipping immediate repeats).
+        if self.history.last().map(|h| h != &text).unwrap_or(true) {
+            self.history.push(text.clone());
+        }
+        self.history_idx = None;
+        self.scroll_to_bottom();
         // `/command`
         if text.trim().starts_with('/') {
             return self.run_command(text.trim());
@@ -593,7 +949,8 @@ impl App {
             default_system(self.mode),
         );
         drop(conv);
-        self.input.clear();
+        self.set_input(String::new());
+        self.scroll_to_bottom();
         self.undo_buf.clear();
         self.redo_buf.clear();
         {
@@ -685,7 +1042,8 @@ impl App {
             .status()
             .map_err(|e| anyhow::anyhow!("failed to open editor: {e}"))?;
         if status.success() {
-            self.input = std::fs::read_to_string(&tmp).unwrap_or_default();
+            let buf = std::fs::read_to_string(&tmp).unwrap_or_default();
+            self.set_input(buf);
         }
         Ok(())
     }
@@ -707,7 +1065,7 @@ impl App {
         match parts[0] {
             "/help" | "/?" | "/commands" => {
                 self.append_assistant(
-                    "commands:\n  /mode build|plan   switch mode\n  /model <name>      set model\n  /models            list tools/help\n  /new /clear        new session\n  /compact           summarize\n  /sessions          list sessions\n  /undo              undo last turn\n  /redo              redo undone turn\n  /export            export chat as markdown\n  /editor            compose in $EDITOR\n  /init              rule/todo help\n  /exit /quit        quit\n\nleader (ctrl+x): n new · l sessions · m models · e editor · s status · x export · u undo · c compact · q quit\n  Tab: mode · Esc: interrupt · Ctrl+P: commands"
+                    "commands:\n  /mode build|plan   switch mode\n  /model <name>      set model\n  /models            list tools/help\n  /new /clear        new session\n  /compact           summarize\n  /sessions          list sessions\n  /undo              undo last turn\n  /redo              redo undone turn\n  /export            export chat as markdown\n  /editor            compose in $EDITOR\n  /init              rule/todo help\n  /exit /quit        quit\n\nprompt: type `/` for command completion, `@` for file paths\n  Tab/Enter accept completion · Esc dismiss\n  ←/→ ctrl+←/→ home/end move the caret · ctrl+w delete word\n  ↑/↓ recall earlier prompts · ctrl+j newline · ctrl+u clear\n\ntranscript: pgup/pgdn or shift+↑/↓ or mouse wheel to scroll\n\nleader (ctrl+x): n new · l sessions · m models · e editor · s status · x export · u undo · c compact · q quit\n  Tab: mode · Esc: interrupt · Ctrl+P: commands"
                         .into(),
                 );
             }
@@ -863,7 +1221,8 @@ fn make_sink(shared: Arc<Shared>) -> impl FnMut() -> Box<dyn FnMut(AgentEvent) +
 fn init_terminal() -> Result<ratatui::DefaultTerminal> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Alternate screen + mouse capture so the transcript wheel-scrolls.
+    execute!(stdout, EnterAlternateScreen, event::EnableMouseCapture)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut t = ratatui::Terminal::new(backend)?;
     t.hide_cursor()?;
@@ -873,6 +1232,10 @@ fn init_terminal() -> Result<ratatui::DefaultTerminal> {
 fn restore_terminal(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     terminal::disable_raw_mode()?;
     terminal.show_cursor()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        event::DisableMouseCapture
+    )?;
     Ok(())
 }
