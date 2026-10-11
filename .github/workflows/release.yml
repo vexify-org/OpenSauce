@@ -30,7 +30,9 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             plat: linux-aarch64
-          - os: macos-13
+          # The retired `macos-13` Intel image is no longer provisioned, so the
+          # Intel binary is cross-compiled from an Apple Silicon runner.
+          - os: macos-latest
             target: x86_64-apple-darwin
             plat: darwin-x86_64
           - os: macos-latest
